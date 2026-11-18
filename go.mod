@@ -1,4 +1,4 @@
-module github.com/harnyk/gh-hide
+module github.com/harnyk/gh-pyra
 
 go 1.26.7
 

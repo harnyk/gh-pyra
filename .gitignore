@@ -3,6 +3,6 @@
 docs/superpowers/
 
 # Build output
-/gh-hide
-/gh-hide.exe
+/gh-pyra
+/gh-pyra.exe
 /dist/

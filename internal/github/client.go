@@ -10,7 +10,7 @@ import (
 	gh "github.com/cli/go-gh/v2"
 	"github.com/cli/go-gh/v2/pkg/api"
 
-	"github.com/harnyk/gh-hide/internal/hide"
+	"github.com/harnyk/gh-pyra/internal/hide"
 )
 
 const listFilesQuery = `query ListPullRequestFiles($pullRequestId: ID!, $endCursor: String) {

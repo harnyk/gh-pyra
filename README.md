@@ -1,73 +1,75 @@
-# gh-hide
+# gh-pyra
 
-A [GitHub CLI](https://cli.github.com/) extension (`gh hide`) that marks pull request files as viewed so they collapse in the review UI and stay out of the way. Filters are plain substrings of the file path by default, or glob patterns with `--wildcard`.
+A [GitHub CLI](https://cli.github.com/) extension (`gh pyra`): a swiss army knife for pull requests.
+
+*Pyra* is "potato" in the Poznań dialect of Polish.
+
+Currently it helps review large pull requests by marking noisy files as viewed, so they collapse in the review UI and stay out of the way.
 
 ## Requirements
 
 - [GitHub CLI](https://cli.github.com/) (`gh`), authenticated (`gh auth login`)
-- Current branch is checked out locally and has an open PR (`gh pr view` resolves it)
+- Current branch has an open PR (`gh pr view` resolves it)
 
 ## Installation
 
-### From GitHub
-
 ```bash
-gh extension install harnyk/gh-hide
+gh extension install harnyk/gh-pyra
 ```
 
 `gh` downloads the precompiled binary for your platform from the latest GitHub release.
+
+Upgrade / remove:
+
+```bash
+gh extension upgrade gh-pyra
+gh extension remove gh-pyra
+```
 
 ### From a local clone
 
 Requires Go (see `go.mod` for the version).
 
 ```bash
-cd /path/to/gh-hide
-go build -o gh-hide .
+cd /path/to/gh-pyra
+go build -o gh-pyra .
 gh extension install .
 ```
 
-Rebuild with `go build -o gh-hide .` after pulling changes.
+Rebuild with `go build -o gh-pyra .` after pulling changes.
 
-Verify:
+## Commands
 
-```bash
-gh hide --help   # not always available; more reliable:
-gh extension list | grep gh-hide
-```
+| Command | Description |
+|---------|-------------|
+| `gh pyra hide FILTER...` | Mark matching files as viewed |
+| `gh pyra show FILTER...` | Unmark matching files as viewed (alias: `unhide`) |
+| `gh pyra count` | Count viewed and not viewed files |
 
-### Upgrade / remove
+Run `gh pyra <command> --help` for details. Commands operate on the pull request of the current branch.
 
-```bash
-gh extension upgrade gh-hide
-gh extension remove gh-hide
-```
+### Hide files
 
-## Usage
-
-Run commands from the **repository root on a branch with an open PR**.
-
-### Hide files by path substring
-
-A file matches when its PR path **contains** `FILTER` literally (substring match).
+By default a filter is a plain **substring** of the file path (not a regex). A file is processed when it matches **any** of the filters.
 
 ```bash
 # anything with .spec. in the path
-gh hide '.spec.'
+gh pyra hide '.spec.'
 
-# lockfiles
-gh hide 'pnpm-lock.yaml'
+# lockfiles and everything under generated/
+gh pyra hide 'pnpm-lock.yaml' 'generated/'
 
-# everything under a directory
-gh hide 'generated/'
+# every file in the PR
+gh pyra hide --all
 ```
 
-### Several filters
+### Show files again
 
-Pass several filters to process files matching **any** of them:
+`show` takes the same filters and flags as `hide`:
 
 ```bash
-gh hide '.spec.' 'pnpm-lock.yaml' 'generated/'
+gh pyra show '.spec.'
+gh pyra show --all
 ```
 
 ### Wildcard (glob) filters
@@ -86,60 +88,31 @@ A pattern without `/` is also matched against the file name alone, so it works i
 
 ```bash
 # *.spec.ts files in any directory
-gh hide -w '*.spec.ts'
+gh pyra hide -w '*.spec.ts'
 
 # everything under generated/ at the repository root
-gh hide -w 'generated/**'
+gh pyra hide -w 'generated/**'
 
 # YAML anywhere under src/, plus snapshot files anywhere
-gh hide -w 'src/**/*.{yaml,yml}' '*.snap'
+gh pyra hide -w 'src/**/*.{yaml,yml}' '*.snap'
 ```
 
 Quote patterns so the shell does not expand them. Without `--wildcard`, characters like `*` and `[` are matched literally.
 
-### Dry run (no API changes)
+### Flags of `hide` and `show`
+
+| Flag | Description |
+|------|-------------|
+| `-w`, `--wildcard` | Treat filters as glob patterns |
+| `-a`, `--all` | Process every file (no filters allowed) |
+| `-n`, `--dry-run` | Show what would change without calling the API |
+| `-j`, `--concurrency N` | Files updated in parallel (default 8) |
+
+### Count viewed files
 
 ```bash
-gh hide --dry-run '.spec.'
-gh hide -n '.spec.'
+gh pyra count
 ```
-
-### Hide every file in the PR
-
-```bash
-gh hide --all
-gh hide -a
-```
-
-Do not pass filters or `--wildcard` with `--all`.
-
-### Unhide (mark as not viewed again)
-
-```bash
-gh hide --unhide '.spec.'
-gh hide -u '.spec.'
-
-# everything currently marked viewed
-gh hide --all --unhide
-```
-
-### Concurrency
-
-Files are marked (or unmarked) in parallel, 8 at a time by default:
-
-```bash
-gh hide --concurrency 4 '.spec.'
-gh hide -j 1 '.spec.'   # sequential
-```
-
-### Count viewed vs not viewed
-
-```bash
-gh hide --count
-gh hide -c
-```
-
-Example output:
 
 ```text
 visible: 12
@@ -149,18 +122,19 @@ total  : 57
 
 ## Behavior
 
-- Files already marked viewed are skipped on a normal `hide` (message on stderr).
-- On `--unhide`, files that are not viewed yet are skipped.
-- No matches → exit code 0 and `Marked 0 file(s) as viewed.`
-- Progress messages may appear in any order because files are processed concurrently.
+- `hide` skips files already marked viewed; `show` skips files not marked viewed.
+- Progress messages go to stderr and may appear in any order because files are processed concurrently.
 - If a request fails, remaining requests are cancelled and the command exits with code 1.
 - Invalid arguments → exit code 2; `gh`/API errors → exit code 1.
 
-Built-in help:
+## Migrating from gh-hide
 
-```bash
-gh hide --help
-```
+| gh-hide | gh-pyra |
+|---------|---------|
+| `gh hide FILTER` | `gh pyra hide FILTER` |
+| `gh hide -u FILTER` | `gh pyra show FILTER` |
+| `gh hide --all` | `gh pyra hide --all` |
+| `gh hide -c` | `gh pyra count` |
 
 ## Development and tests
 
@@ -175,8 +149,8 @@ go test -race ./...
 Releases are built by [GoReleaser](https://goreleaser.com/) in GitHub Actions when a `v*` tag is pushed:
 
 ```bash
-git tag v1.0.0
-git push origin v1.0.0
+git tag v0.1.0
+git push origin v0.1.0
 ```
 
 Check the configuration and build locally without publishing:
