@@ -8,7 +8,7 @@ import (
 	"testing"
 
 	"github.com/harnyk/gh-pyra/internal/github"
-	"github.com/harnyk/gh-pyra/internal/hide"
+	"github.com/harnyk/gh-pyra/internal/review"
 )
 
 type fakeClient struct {
@@ -17,12 +17,16 @@ type fakeClient struct {
 	unmarked []string
 }
 
-func (f *fakeClient) ResolvePullRequest(context.Context) (hide.PullRequest, error) {
-	return hide.PullRequest{ID: "PR_1", Number: 1}, nil
+func (f *fakeClient) ResolvePullRequest(context.Context) (review.PullRequest, error) {
+	return review.PullRequest{ID: "PR_1", Number: 1}, nil
 }
 
-func (f *fakeClient) ListFiles(context.Context, string) ([]hide.File, error) {
-	return []hide.File{{Path: "a.spec.ts"}, {Path: "b.ts", Viewed: true}}, nil
+func (f *fakeClient) ListFiles(context.Context, string) ([]review.File, error) {
+	return []review.File{{Path: "a.spec.ts"}, {Path: "b.ts", State: review.Viewed}}, nil
+}
+
+func (f *fakeClient) RepoConfig(context.Context) ([]byte, error) {
+	return []byte("presets:\n  specs: ['*.spec.ts']\n"), nil
 }
 
 func (f *fakeClient) SetViewed(_ context.Context, _, path string, viewed bool) error {
@@ -35,8 +39,15 @@ func (f *fakeClient) SetViewed(_ context.Context, _, path string, viewed bool) e
 }
 
 func execute(args ...string) (*fakeClient, string, error) {
+	return executeIn(nil, args...)
+}
+
+func executeIn(t *testing.T, args ...string) (*fakeClient, string, error) {
+	if t != nil {
+		t.Setenv("GH_PYRA_CONFIG", t.TempDir()+"/none.yml")
+	}
 	c := &fakeClient{}
-	cmd := NewRootCmd("test", func(t github.Target) (hide.Client, error) {
+	cmd := NewRootCmd("test", func(t github.Target) (review.Client, error) {
 		c.target = t
 		return c, nil
 	})
@@ -78,7 +89,13 @@ func TestInvalidArgsAreUsageErrors(t *testing.T) {
 		"empty among filters":   {"hide", "a", ""},
 		"all with filter":       {"hide", "--all", ".spec."},
 		"bad wildcard":          {"show", "-w", "[a"},
-		"wildcard with all":     {"hide", "-w", "--all"},
+		"include with all":      {"hide", "--all", "@specs"},
+		"empty exclude":         {"hide", "-x", ""},
+		"negated preset":        {"hide", "!@specs"},
+		"bad preset name":       {"hide", "@"},
+		"bad state":             {"ls", "-s", "nope"},
+		"presets with args":     {"presets", "x"},
+		"bad wildcard ls":       {"ls", "-w", "[a"},
 		"count with args":       {"count", "x"},
 		"unknown flag":          {"hide", "--nope", "a"},
 		"zero concurrency":      {"hide", "-j", "0", "a"},
@@ -92,7 +109,7 @@ func TestInvalidArgsAreUsageErrors(t *testing.T) {
 	for name, args := range cases {
 		t.Run(name, func(t *testing.T) {
 			called := false
-			cmd := NewRootCmd("test", func(github.Target) (hide.Client, error) {
+			cmd := NewRootCmd("test", func(github.Target) (review.Client, error) {
 				called = true
 				return nil, errors.New("must not be called")
 			})
@@ -129,5 +146,32 @@ func TestTargetFlags(t *testing.T) {
 		if c.target != tc.want {
 			t.Errorf("%v: target = %+v, want %+v", tc.args, c.target, tc.want)
 		}
+	}
+}
+
+func TestNewCommands(t *testing.T) {
+	c, out, err := executeIn(t, "hide", "@specs")
+	if err != nil || len(c.marked) != 1 || c.marked[0] != "a.spec.ts" {
+		t.Fatalf("hide @specs: err=%v marked=%v", err, c.marked)
+	}
+
+	c, _, err = executeIn(t, "hide", "--all", "-x", ".spec.")
+	if err != nil || len(c.marked) != 0 {
+		t.Fatalf("hide --all -x: err=%v marked=%v", err, c.marked)
+	}
+
+	_, out, err = executeIn(t, "ls", "-s", "viewed")
+	if err != nil || !strings.Contains(out, "b.ts") || strings.Contains(out, "a.spec.ts") {
+		t.Fatalf("ls -s viewed: err=%v out=%s", err, out)
+	}
+
+	_, out, err = executeIn(t, "list", "!b.ts")
+	if err != nil || strings.Contains(out, "b.ts") || !strings.Contains(out, "a.spec.ts") {
+		t.Fatalf("list !b.ts: err=%v out=%s", err, out)
+	}
+
+	_, out, err = executeIn(t, "presets")
+	if err != nil || !strings.Contains(out, "@specs") || !strings.Contains(out, "@lockfiles") {
+		t.Fatalf("presets: err=%v out=%s", err, out)
 	}
 }
