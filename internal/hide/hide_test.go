@@ -28,7 +28,7 @@ type fakeClient struct {
 	maxSeen atomic.Int32
 }
 
-func (f *fakeClient) CurrentPullRequest(context.Context) (PullRequest, error) {
+func (f *fakeClient) ResolvePullRequest(context.Context) (PullRequest, error) {
 	return PullRequest{ID: "PR_node_42", Number: 42}, nil
 }
 

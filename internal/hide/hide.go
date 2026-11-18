@@ -18,6 +18,7 @@ const DefaultConcurrency = 8
 type PullRequest struct {
 	ID     string
 	Number int
+	URL    string
 }
 
 // File is a pull request file together with its viewed state.
@@ -28,7 +29,7 @@ type File struct {
 
 // Client is the subset of the GitHub API used by this package.
 type Client interface {
-	CurrentPullRequest(ctx context.Context) (PullRequest, error)
+	ResolvePullRequest(ctx context.Context) (PullRequest, error)
 	ListFiles(ctx context.Context, pullRequestID string) ([]File, error)
 	SetViewed(ctx context.Context, pullRequestID, path string, viewed bool) error
 }
@@ -82,11 +83,15 @@ func (r *Runner) Run(ctx context.Context, opts Options) error {
 		concurrency = DefaultConcurrency
 	}
 
-	pr, err := r.Client.CurrentPullRequest(ctx)
+	pr, err := r.Client.ResolvePullRequest(ctx)
 	if err != nil {
-		return fmt.Errorf("resolve current pull request: %w", err)
+		return fmt.Errorf("resolve pull request: %w", err)
 	}
-	r.logf("Found PR #%d.\n", pr.Number)
+	if pr.URL != "" {
+		r.logf("Found PR #%d (%s).\n", pr.Number, pr.URL)
+	} else {
+		r.logf("Found PR #%d.\n", pr.Number)
+	}
 
 	files, err := r.Client.ListFiles(ctx, pr.ID)
 	if err != nil {
@@ -152,9 +157,9 @@ func (r *Runner) Run(ctx context.Context, opts Options) error {
 
 // Count prints how many files are viewed and not viewed.
 func (r *Runner) Count(ctx context.Context) error {
-	pr, err := r.Client.CurrentPullRequest(ctx)
+	pr, err := r.Client.ResolvePullRequest(ctx)
 	if err != nil {
-		return fmt.Errorf("resolve current pull request: %w", err)
+		return fmt.Errorf("resolve pull request: %w", err)
 	}
 	files, err := r.Client.ListFiles(ctx, pr.ID)
 	if err != nil {
