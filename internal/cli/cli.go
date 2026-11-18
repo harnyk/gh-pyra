@@ -8,11 +8,16 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/harnyk/gh-pyra/internal/github"
 	"github.com/harnyk/gh-pyra/internal/hide"
 )
 
-// ClientFactory creates the GitHub client lazily, only after arguments are valid.
-type ClientFactory func() (hide.Client, error)
+// ClientFactory creates the GitHub client for the selected pull request. It is
+// called lazily, only after arguments are valid.
+type ClientFactory func(target github.Target) (hide.Client, error)
+
+// clientFunc creates a client for the target chosen by global flags.
+type clientFunc func() (hide.Client, error)
 
 // UsageError signals invalid command-line usage (exit code 2).
 type UsageError struct{ error }
@@ -22,18 +27,27 @@ func usageErrorf(format string, args ...any) error {
 }
 
 // NewRootCmd builds the `gh pyra` command.
-func NewRootCmd(version string, newClient ClientFactory) *cobra.Command {
+func NewRootCmd(version string, newClientFor ClientFactory) *cobra.Command {
+	var target github.Target
+	newClient := func() (hide.Client, error) { return newClientFor(target) }
+
 	root := &cobra.Command{
 		Use: "pyra",
 		Annotations: map[string]string{
 			cobra.CommandDisplayNameAnnotation: "gh pyra",
 		},
 		Short:         "Swiss army knife for GitHub pull requests",
-		Long:          "Swiss army knife for GitHub pull requests.\n\nCommands operate on the pull request of the current branch.",
+		Long:          "Swiss army knife for GitHub pull requests.\n\nCommands operate on the pull request of the current branch unless --pr is given.",
 		Version:       version,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		Args:          cobra.ArbitraryArgs,
+		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			if target.Repo != "" && target.PR == "" {
+				return usageErrorf("--repo requires --pr")
+			}
+			return nil
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if len(args) == 0 {
 				return cmd.Help()
@@ -45,6 +59,10 @@ func NewRootCmd(version string, newClient ClientFactory) *cobra.Command {
 			return UsageError{errors.New(msg)}
 		},
 	}
+	pf := root.PersistentFlags()
+	pf.StringVar(&target.PR, "pr", "", "`PR` number, URL or branch (default: PR of the current branch)")
+	pf.StringVarP(&target.Repo, "repo", "R", "", "select another repository using the `[HOST/]OWNER/REPO` format (requires --pr)")
+
 	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error { return UsageError{err} })
 	root.CompletionOptions.HiddenDefaultCmd = true
 
@@ -71,7 +89,7 @@ Several FILTERs may be given; a file is selected when it matches any of them.
 With --all, process every file in the pull request (FILTER must be omitted).`
 
 // newMarkCmd builds `hide` (mark as viewed) or `show` (unmark as viewed).
-func newMarkCmd(newClient ClientFactory, unhide bool) *cobra.Command {
+func newMarkCmd(newClient clientFunc, unhide bool) *cobra.Command {
 	opts := hide.Options{Unhide: unhide}
 
 	cmd := &cobra.Command{
@@ -131,7 +149,7 @@ func newMarkCmd(newClient ClientFactory, unhide bool) *cobra.Command {
 	return cmd
 }
 
-func newCountCmd(newClient ClientFactory) *cobra.Command {
+func newCountCmd(newClient clientFunc) *cobra.Command {
 	return &cobra.Command{
 		Use:   "count",
 		Short: "Count viewed and not viewed pull request files",

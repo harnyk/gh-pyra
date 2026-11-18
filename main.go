@@ -20,7 +20,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
-	root := cli.NewRootCmd(version, func() (hide.Client, error) { return github.New() })
+	root := cli.NewRootCmd(version, func(t github.Target) (hide.Client, error) { return github.New(t), nil })
 	cmd, err := root.ExecuteContextC(ctx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)

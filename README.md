@@ -9,7 +9,7 @@ Currently it helps review large pull requests by marking noisy files as viewed, 
 ## Requirements
 
 - [GitHub CLI](https://cli.github.com/) (`gh`), authenticated (`gh auth login`)
-- Current branch has an open PR (`gh pr view` resolves it)
+- A pull request to work on: the PR of the current branch (as `gh pr view` resolves it), or one selected with `--pr`
 
 ## Installation
 
@@ -46,7 +46,27 @@ Rebuild with `go build -o gh-pyra .` after pulling changes.
 | `gh pyra show FILTER...` | Unmark matching files as viewed (alias: `unhide`) |
 | `gh pyra count` | Count viewed and not viewed files |
 
-Run `gh pyra <command> --help` for details. Commands operate on the pull request of the current branch.
+Run `gh pyra <command> --help` for details.
+
+### Selecting a pull request
+
+By default commands operate on the pull request of the current branch. Global flags select another one, the same way `gh pr view` does:
+
+| Flag | Description |
+|------|-------------|
+| `--pr PR` | Pull request number, URL or branch name |
+| `-R`, `--repo [HOST/]OWNER/REPO` | Repository of the pull request (requires `--pr`) |
+
+```bash
+# PR #123 of the current repository
+gh pyra hide --pr 123 'pnpm-lock.yaml'
+
+# PR in another repository
+gh pyra count -R octo/widgets --pr 45
+
+# by URL (also works for GitHub Enterprise hosts)
+gh pyra show --all --pr https://github.com/octo/widgets/pull/45
+```
 
 ### Hide files
 
