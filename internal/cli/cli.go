@@ -8,16 +8,18 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/harnyk/gh-pyra/internal/config"
+	"github.com/harnyk/gh-pyra/internal/filter"
 	"github.com/harnyk/gh-pyra/internal/github"
-	"github.com/harnyk/gh-pyra/internal/hide"
+	"github.com/harnyk/gh-pyra/internal/review"
 )
 
 // ClientFactory creates the GitHub client for the selected pull request. It is
 // called lazily, only after arguments are valid.
-type ClientFactory func(target github.Target) (hide.Client, error)
+type ClientFactory func(target github.Target) (review.Client, error)
 
 // clientFunc creates a client for the target chosen by global flags.
-type clientFunc func() (hide.Client, error)
+type clientFunc func() (review.Client, error)
 
 // UsageError signals invalid command-line usage (exit code 2).
 type UsageError struct{ error }
@@ -26,10 +28,19 @@ func usageErrorf(format string, args ...any) error {
 	return UsageError{fmt.Errorf(format, args...)}
 }
 
+func noArgs(name string) cobra.PositionalArgs {
+	return func(cmd *cobra.Command, args []string) error {
+		if len(args) != 0 {
+			return usageErrorf("%s takes no arguments", name)
+		}
+		return nil
+	}
+}
+
 // NewRootCmd builds the `gh pyra` command.
 func NewRootCmd(version string, newClientFor ClientFactory) *cobra.Command {
 	var target github.Target
-	newClient := func() (hide.Client, error) { return newClientFor(target) }
+	newClient := func() (review.Client, error) { return newClientFor(target) }
 
 	root := &cobra.Command{
 		Use: "pyra",
@@ -69,39 +80,83 @@ func NewRootCmd(version string, newClientFor ClientFactory) *cobra.Command {
 	root.AddCommand(
 		newMarkCmd(newClient, false),
 		newMarkCmd(newClient, true),
+		newListCmd(newClient),
 		newCountCmd(newClient),
+		newPresetsCmd(newClient),
 	)
 	return root
 }
 
-const filterHelp = `By default FILTER is a literal substring of the file path (not a regex).
-With --wildcard, FILTER is a glob pattern matched against the whole path:
+func newRunner(cmd *cobra.Command, newClient clientFunc) (*review.Runner, error) {
+	client, err := newClient()
+	if err != nil {
+		return nil, err
+	}
+	return &review.Runner{
+		Client:      client,
+		UserPresets: config.LoadUser,
+		Out:         cmd.OutOrStdout(),
+		Err:         cmd.ErrOrStderr(),
+	}, nil
+}
+
+const filterHelp = `Filters:
+  PATTERN     include files matching PATTERN
+  !PATTERN    exclude files matching PATTERN (also: --exclude PATTERN)
+  @NAME       include the patterns of preset NAME (see "gh pyra presets")
+A file is selected when it matches any include and no exclude. With only
+excludes, every other file is selected. Start a filter with \! or \@ to
+match a literal "!" or "@".
+
+By default PATTERN is a literal substring of the file path (not a regex).
+With --wildcard, PATTERN is a glob pattern matched against the whole path:
   *       any characters except /
   **      any characters including / (whole path segments)
   ?       one character except /
   [abc]   one character from the set ([!abc] negates)
   {a,b}   either alternative
 A pattern without / is also matched against the file name, so '*.spec.ts'
-selects such files in any directory. Quote patterns to keep the shell from
-expanding them.
+selects such files in any directory. Preset patterns are always globs.
+Quote filters to keep the shell from expanding them.`
 
-Several FILTERs may be given; a file is selected when it matches any of them.
-With --all, process every file in the pull request (FILTER must be omitted).`
+type filterFlags struct {
+	wildcard bool
+	excludes []string
+}
+
+func (f *filterFlags) register(cmd *cobra.Command) {
+	cmd.Flags().BoolVarP(&f.wildcard, "wildcard", "w", false, "treat patterns as globs instead of substrings")
+	cmd.Flags().StringArrayVarP(&f.excludes, "exclude", "x", nil, "exclude files matching `PATTERN` (repeatable)")
+}
+
+func (f *filterFlags) parse(args []string) (filter.Spec, error) {
+	spec, err := filter.Parse(args, f.excludes, f.wildcard)
+	if err != nil {
+		return filter.Spec{}, UsageError{err}
+	}
+	return spec, nil
+}
 
 // newMarkCmd builds `hide` (mark as viewed) or `show` (unmark as viewed).
 func newMarkCmd(newClient clientFunc, unhide bool) *cobra.Command {
-	opts := hide.Options{Unhide: unhide}
+	var (
+		ff   filterFlags
+		all  bool
+		opts = review.Options{Unhide: unhide}
+	)
 
 	cmd := &cobra.Command{
-		Use:   "hide [--wildcard] FILTER... | --all",
+		Use:   "hide FILTER... | --all",
 		Short: "Mark matching pull request files as viewed",
 		Long:  "Mark matching pull request files as viewed, collapsing them in the review UI.\n\n" + filterHelp,
 		Example: `  gh pyra hide '.spec.' 'pnpm-lock.yaml'
   gh pyra hide -w '*.spec.ts' 'generated/**'
-  gh pyra hide --all --dry-run`,
+  gh pyra hide @lockfiles @snapshots
+  gh pyra hide 'src/' '!src/core/'
+  gh pyra hide --all -x 'src/core/' --dry-run`,
 	}
 	if unhide {
-		cmd.Use = "show [--wildcard] FILTER... | --all"
+		cmd.Use = "show FILTER... | --all"
 		cmd.Aliases = []string{"unhide"}
 		cmd.Short = "Unmark matching pull request files as viewed"
 		cmd.Long = "Unmark matching pull request files as viewed, expanding them again in the review UI.\n\n" + filterHelp
@@ -111,41 +166,87 @@ func newMarkCmd(newClient clientFunc, unhide bool) *cobra.Command {
 	}
 
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
+		spec, err := ff.parse(args)
+		if err != nil {
+			return err
+		}
 		switch {
-		case opts.All:
-			if len(args) != 0 {
-				return usageErrorf("FILTER must be omitted with --all")
-			}
-			if opts.Wildcard {
-				return usageErrorf("--wildcard cannot be used with --all")
-			}
-		case len(args) == 0:
+		case all && spec.HasIncludes():
+			return usageErrorf("include filters cannot be used with --all (excludes can)")
+		case !all && spec.IsEmpty():
 			return usageErrorf("at least one FILTER is required (or --all)")
-		default:
-			if _, err := hide.NewMatcher(args, opts.Wildcard); err != nil {
-				return UsageError{err}
-			}
 		}
 		if opts.Concurrency < 1 {
 			return usageErrorf("--concurrency must be at least 1")
 		}
+		opts.Filter = spec
 		return nil
 	}
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
-		client, err := newClient()
+		r, err := newRunner(cmd, newClient)
 		if err != nil {
 			return err
 		}
-		opts.Filters = args
-		r := &hide.Runner{Client: client, Out: cmd.OutOrStdout(), Err: cmd.ErrOrStderr()}
 		return r.Run(cmd.Context(), opts)
 	}
 
+	ff.register(cmd)
 	f := cmd.Flags()
-	f.BoolVarP(&opts.Wildcard, "wildcard", "w", false, "treat FILTERs as glob patterns instead of substrings")
-	f.BoolVarP(&opts.All, "all", "a", false, "process every file in the pull request")
+	f.BoolVarP(&all, "all", "a", false, "process every file in the pull request")
 	f.BoolVarP(&opts.DryRun, "dry-run", "n", false, "show what would be changed without calling the API")
-	f.IntVarP(&opts.Concurrency, "concurrency", "j", hide.DefaultConcurrency, "number of files to update in parallel")
+	f.IntVarP(&opts.Concurrency, "concurrency", "j", review.DefaultConcurrency, "number of files to update in parallel")
+	return cmd
+}
+
+func newListCmd(newClient clientFunc) *cobra.Command {
+	var (
+		ff     filterFlags
+		states []string
+		opts   review.ListOptions
+	)
+	cmd := &cobra.Command{
+		Use:     "ls [FILTER...]",
+		Aliases: []string{"list"},
+		Short:   "List pull request files with their viewed state",
+		Long: `List pull request files with their viewed state and line changes.
+
+States:
+  unviewed   not marked as viewed
+  viewed     marked as viewed
+  changed    marked as viewed, but the file changed since then
+
+Without filters every file is listed.
+
+` + filterHelp,
+		Example: `  gh pyra ls
+  gh pyra ls -s changed
+  gh pyra ls -w '*.go' -x vendor/`,
+		Args: func(cmd *cobra.Command, args []string) error {
+			spec, err := ff.parse(args)
+			if err != nil {
+				return err
+			}
+			opts.Filter = spec
+			opts.States = nil
+			for _, s := range states {
+				st, err := review.ParseState(s)
+				if err != nil {
+					return UsageError{err}
+				}
+				opts.States = append(opts.States, st)
+			}
+			return nil
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			r, err := newRunner(cmd, newClient)
+			if err != nil {
+				return err
+			}
+			return r.List(cmd.Context(), opts)
+		},
+	}
+	ff.register(cmd)
+	cmd.Flags().StringSliceVarP(&states, "state", "s", nil, "only list files in `STATE` (unviewed, viewed, changed; repeatable)")
 	return cmd
 }
 
@@ -153,19 +254,43 @@ func newCountCmd(newClient clientFunc) *cobra.Command {
 	return &cobra.Command{
 		Use:   "count",
 		Short: "Count viewed and not viewed pull request files",
-		Args: func(cmd *cobra.Command, args []string) error {
-			if len(args) != 0 {
-				return usageErrorf("count takes no arguments")
-			}
-			return nil
-		},
+		Args:  noArgs("count"),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			client, err := newClient()
+			r, err := newRunner(cmd, newClient)
 			if err != nil {
 				return err
 			}
-			r := &hide.Runner{Client: client, Out: cmd.OutOrStdout(), Err: cmd.ErrOrStderr()}
 			return r.Count(cmd.Context())
+		},
+	}
+}
+
+func newPresetsCmd(newClient clientFunc) *cobra.Command {
+	userPath, _ := config.UserPath()
+	return &cobra.Command{
+		Use:   "presets",
+		Short: "List filter presets available for the pull request",
+		Long: fmt.Sprintf(`List filter presets available for the pull request.
+
+Presets are named lists of glob patterns, referenced as @NAME in filters.
+They come from (later sources override earlier ones):
+  1. built-in presets
+  2. %s on the base branch of the pull request
+  3. the user configuration file (%s; override with $GH_PYRA_CONFIG)
+
+Configuration format:
+  presets:
+    noise:
+      - pnpm-lock.yaml
+      - '**/*.snap'
+      - '!src/keep.snap'`, config.RepoPath, userPath),
+		Args: noArgs("presets"),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			r, err := newRunner(cmd, newClient)
+			if err != nil {
+				return err
+			}
+			return r.Presets(cmd.Context())
 		},
 	}
 }

@@ -1,4 +1,4 @@
-// Package github implements hide.Client on top of the GitHub CLI.
+// Package github implements review.Client on top of the GitHub CLI.
 package github
 
 import (
@@ -12,14 +12,15 @@ import (
 	gh "github.com/cli/go-gh/v2"
 	"github.com/cli/go-gh/v2/pkg/api"
 
-	"github.com/harnyk/gh-pyra/internal/hide"
+	"github.com/harnyk/gh-pyra/internal/config"
+	"github.com/harnyk/gh-pyra/internal/review"
 )
 
 const listFilesQuery = `query ListPullRequestFiles($pullRequestId: ID!, $endCursor: String) {
   node(id: $pullRequestId) {
     ... on PullRequest {
       files(first: 100, after: $endCursor) {
-        nodes { path viewerViewedState }
+        nodes { path additions deletions viewerViewedState }
         pageInfo { hasNextPage endCursor }
       }
     }
@@ -51,6 +52,9 @@ type Target struct {
 type Client struct {
 	target Target
 	gql    *api.GraphQLClient
+
+	// Set by ResolvePullRequest.
+	owner, name, baseRef string
 }
 
 // New creates a Client for the given target. The API host is determined when
@@ -68,53 +72,60 @@ func prViewArgs(t Target) []string {
 	if t.Repo != "" {
 		args = append(args, "--repo", t.Repo)
 	}
-	return append(args, "--json", "id,number,url")
+	return append(args, "--json", "id,number,url,baseRefName")
 }
 
-// hostFromURL extracts the GitHub host from a pull request URL.
-func hostFromURL(rawURL string) (string, error) {
+// parsePullRequestURL extracts the host, owner and repository name from a
+// pull request URL such as https://HOST/OWNER/REPO/pull/N.
+func parsePullRequestURL(rawURL string) (host, owner, name string, err error) {
 	u, err := url.Parse(rawURL)
 	if err != nil || u.Host == "" {
-		return "", fmt.Errorf("unexpected pull request URL %q", rawURL)
+		return "", "", "", fmt.Errorf("unexpected pull request URL %q", rawURL)
 	}
-	return u.Host, nil
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	if len(parts) < 4 || parts[2] != "pull" {
+		return "", "", "", fmt.Errorf("unexpected pull request URL %q", rawURL)
+	}
+	return u.Host, parts[0], parts[1], nil
 }
 
 // ResolvePullRequest resolves the target pull request via `gh pr view` and
 // prepares a GraphQL client for its host.
-func (c *Client) ResolvePullRequest(ctx context.Context) (hide.PullRequest, error) {
+func (c *Client) ResolvePullRequest(ctx context.Context) (review.PullRequest, error) {
 	stdout, stderr, err := gh.ExecContext(ctx, prViewArgs(c.target)...)
 	if err != nil {
 		if msg := strings.TrimSpace(stderr.String()); msg != "" {
-			return hide.PullRequest{}, fmt.Errorf("%w: %s", err, msg)
+			return review.PullRequest{}, fmt.Errorf("%w: %s", err, msg)
 		}
-		return hide.PullRequest{}, err
+		return review.PullRequest{}, err
 	}
 	var pr struct {
-		ID     string `json:"id"`
-		Number int    `json:"number"`
-		URL    string `json:"url"`
+		ID      string `json:"id"`
+		Number  int    `json:"number"`
+		URL     string `json:"url"`
+		BaseRef string `json:"baseRefName"`
 	}
 	if err := json.Unmarshal(stdout.Bytes(), &pr); err != nil {
-		return hide.PullRequest{}, fmt.Errorf("parse gh pr view output: %w", err)
+		return review.PullRequest{}, fmt.Errorf("parse gh pr view output: %w", err)
 	}
-	host, err := hostFromURL(pr.URL)
+	host, owner, name, err := parsePullRequestURL(pr.URL)
 	if err != nil {
-		return hide.PullRequest{}, err
+		return review.PullRequest{}, err
 	}
+	c.owner, c.name, c.baseRef = owner, name, pr.BaseRef
 	gql, err := api.NewGraphQLClient(api.ClientOptions{Host: host})
 	if err != nil {
-		return hide.PullRequest{}, err
+		return review.PullRequest{}, err
 	}
 	c.gql = gql
-	return hide.PullRequest{ID: pr.ID, Number: pr.Number, URL: pr.URL}, nil
+	return review.PullRequest{ID: pr.ID, Number: pr.Number, URL: pr.URL}, nil
 }
 
 var errNotResolved = errors.New("pull request is not resolved yet")
 
 // ListFiles returns all files of the pull request, following pagination.
-func (c *Client) ListFiles(ctx context.Context, pullRequestID string) ([]hide.File, error) {
-	var files []hide.File
+func (c *Client) ListFiles(ctx context.Context, pullRequestID string) ([]review.File, error) {
+	var files []review.File
 	var cursor *string
 	if c.gql == nil {
 		return nil, errNotResolved
@@ -125,6 +136,8 @@ func (c *Client) ListFiles(ctx context.Context, pullRequestID string) ([]hide.Fi
 				Files struct {
 					Nodes []struct {
 						Path              string `json:"path"`
+						Additions         int    `json:"additions"`
+						Deletions         int    `json:"deletions"`
 						ViewerViewedState string `json:"viewerViewedState"`
 					} `json:"nodes"`
 					PageInfo struct {
@@ -139,7 +152,12 @@ func (c *Client) ListFiles(ctx context.Context, pullRequestID string) ([]hide.Fi
 			return nil, err
 		}
 		for _, n := range resp.Node.Files.Nodes {
-			files = append(files, hide.File{Path: n.Path, Viewed: n.ViewerViewedState == "VIEWED"})
+			files = append(files, review.File{
+				Path:      n.Path,
+				State:     parseViewedState(n.ViewerViewedState),
+				Additions: n.Additions,
+				Deletions: n.Deletions,
+			})
 		}
 		if !resp.Node.Files.PageInfo.HasNextPage {
 			return files, nil
@@ -160,4 +178,56 @@ func (c *Client) SetViewed(ctx context.Context, pullRequestID, path string, view
 	}
 	vars := map[string]any{"pullRequestId": pullRequestID, "path": path}
 	return c.gql.DoWithContext(ctx, mutation, vars, nil)
+}
+
+func parseViewedState(s string) review.State {
+	switch s {
+	case "VIEWED":
+		return review.Viewed
+	case "DISMISSED":
+		return review.Dismissed
+	default:
+		return review.Unviewed
+	}
+}
+
+const repoFileQuery = `query RepoFile($owner: String!, $name: String!, $expression: String!) {
+  repository(owner: $owner, name: $name) {
+    object(expression: $expression) {
+      ... on Blob { text isBinary }
+    }
+  }
+}`
+
+// RepoConfig reads the configuration file from the base branch of the pull
+// request. Reading the base branch (not the PR head) means a pull request
+// cannot change the presets it is reviewed with.
+func (c *Client) RepoConfig(ctx context.Context) ([]byte, error) {
+	if c.gql == nil {
+		return nil, errNotResolved
+	}
+	var resp struct {
+		Repository struct {
+			Object *struct {
+				Text     *string `json:"text"`
+				IsBinary bool    `json:"isBinary"`
+			} `json:"object"`
+		} `json:"repository"`
+	}
+	vars := map[string]any{
+		"owner":      c.owner,
+		"name":       c.name,
+		"expression": c.baseRef + ":" + config.RepoPath,
+	}
+	if err := c.gql.DoWithContext(ctx, repoFileQuery, vars, &resp); err != nil {
+		return nil, err
+	}
+	obj := resp.Repository.Object
+	if obj == nil || obj.Text == nil {
+		return nil, nil
+	}
+	if obj.IsBinary {
+		return nil, errors.New("file is binary")
+	}
+	return []byte(*obj.Text), nil
 }

@@ -1,4 +1,4 @@
-package hide
+package review
 
 import (
 	"bytes"
@@ -11,7 +11,19 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/harnyk/gh-pyra/internal/config"
+	"github.com/harnyk/gh-pyra/internal/filter"
 )
+
+func spec(t *testing.T, wildcard bool, args ...string) filter.Spec {
+	t.Helper()
+	s, err := filter.Parse(args, nil, wildcard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
 
 type call struct {
 	path   string
@@ -20,6 +32,7 @@ type call struct {
 
 type fakeClient struct {
 	files   []File
+	config  []byte
 	failOn  string
 	delay   time.Duration
 	mu      sync.Mutex
@@ -37,6 +50,10 @@ func (f *fakeClient) ListFiles(_ context.Context, id string) ([]File, error) {
 		return nil, fmt.Errorf("unexpected PR id %q", id)
 	}
 	return f.files, nil
+}
+
+func (f *fakeClient) RepoConfig(context.Context) ([]byte, error) {
+	return f.config, nil
 }
 
 func (f *fakeClient) SetViewed(_ context.Context, id, path string, viewed bool) error {
@@ -74,7 +91,7 @@ func (f *fakeClient) paths() []string {
 
 func sampleFiles() []File {
 	return []File{
-		{Path: "src/widget.spec.ts", Viewed: true},
+		{Path: "src/widget.spec.ts", State: Viewed},
 		{Path: "src/xspecy.ts"},
 		{Path: "test name.spec.ts"},
 		{Path: "line\nbreak.spec.ts"},
@@ -106,7 +123,7 @@ func assertNotContains(t *testing.T, s, unwanted string) {
 
 func TestHideByFilter(t *testing.T) {
 	c := &fakeClient{files: sampleFiles()}
-	out, errOut, err := run(t, c, Options{Filters: []string{".spec."}})
+	out, errOut, err := run(t, c, Options{Filter: spec(t, false, ".spec.")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +147,7 @@ func TestHideByFilter(t *testing.T) {
 
 func TestNoMatch(t *testing.T) {
 	c := &fakeClient{files: sampleFiles()}
-	out, _, err := run(t, c, Options{Filters: []string{"no-match"}})
+	out, _, err := run(t, c, Options{Filter: spec(t, false, "no-match")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +159,7 @@ func TestNoMatch(t *testing.T) {
 
 func TestDryRun(t *testing.T) {
 	c := &fakeClient{files: sampleFiles()}
-	out, errOut, err := run(t, c, Options{Filters: []string{".spec."}, DryRun: true})
+	out, errOut, err := run(t, c, Options{Filter: spec(t, false, ".spec."), DryRun: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,7 +174,7 @@ func TestDryRun(t *testing.T) {
 
 func TestUnhide(t *testing.T) {
 	c := &fakeClient{files: sampleFiles()}
-	out, errOut, err := run(t, c, Options{Filters: []string{".spec."}, Unhide: true})
+	out, errOut, err := run(t, c, Options{Filter: spec(t, false, ".spec."), Unhide: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -172,7 +189,7 @@ func TestUnhide(t *testing.T) {
 
 func TestUnhideDryRun(t *testing.T) {
 	c := &fakeClient{files: sampleFiles()}
-	out, errOut, err := run(t, c, Options{Filters: []string{".spec."}, Unhide: true, DryRun: true})
+	out, errOut, err := run(t, c, Options{Filter: spec(t, false, ".spec."), Unhide: true, DryRun: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,26 +202,19 @@ func TestUnhideDryRun(t *testing.T) {
 
 func TestAll(t *testing.T) {
 	c := &fakeClient{files: sampleFiles()}
-	out, _, err := run(t, c, Options{All: true})
+	out, _, err := run(t, c, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	assertContains(t, out, "Marked 4 file(s) as viewed.")
 	assertContains(t, out, "Skipped 1 already viewed file(s).")
 
-	out, _, err = run(t, &fakeClient{files: sampleFiles()}, Options{All: true, Unhide: true})
+	out, _, err = run(t, &fakeClient{files: sampleFiles()}, Options{Unhide: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	assertContains(t, out, "Unmarked 1 file(s) as viewed.")
 	assertContains(t, out, "Skipped 4 not viewed file(s).")
-}
-
-func TestEmptyFilterRejected(t *testing.T) {
-	c := &fakeClient{files: sampleFiles()}
-	if _, _, err := run(t, c, Options{}); err == nil {
-		t.Fatal("expected error for empty filter")
-	}
 }
 
 func TestConcurrencyLimit(t *testing.T) {
@@ -213,7 +223,7 @@ func TestConcurrencyLimit(t *testing.T) {
 		files = append(files, File{Path: fmt.Sprintf("file%02d", i)})
 	}
 	c := &fakeClient{files: files, delay: 20 * time.Millisecond}
-	out, _, err := run(t, c, Options{All: true, Concurrency: DefaultConcurrency})
+	out, _, err := run(t, c, Options{Concurrency: DefaultConcurrency})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,7 +235,7 @@ func TestConcurrencyLimit(t *testing.T) {
 
 func TestMutationFailure(t *testing.T) {
 	c := &fakeClient{files: sampleFiles(), failOn: "src/widget.ts"}
-	out, _, err := run(t, c, Options{All: true, Concurrency: 1})
+	out, _, err := run(t, c, Options{Concurrency: 1})
 	if err == nil || !strings.Contains(err.Error(), "src/widget.ts") {
 		t.Fatalf("expected error mentioning failed path, got %v", err)
 	}
@@ -245,7 +255,7 @@ func TestCount(t *testing.T) {
 
 func TestMultipleFilters(t *testing.T) {
 	c := &fakeClient{files: sampleFiles()}
-	out, _, err := run(t, c, Options{Filters: []string{"test name", "widget.ts"}})
+	out, _, err := run(t, c, Options{Filter: spec(t, false, "test name", "widget.ts")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -258,7 +268,7 @@ func TestMultipleFilters(t *testing.T) {
 
 func TestWildcardRun(t *testing.T) {
 	c := &fakeClient{files: sampleFiles()}
-	out, _, err := run(t, c, Options{Filters: []string{"src/*.ts"}, Wildcard: true})
+	out, _, err := run(t, c, Options{Filter: spec(t, true, "src/*.ts")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -268,4 +278,134 @@ func TestWildcardRun(t *testing.T) {
 	if got := c.paths(); !slices.Equal(got, want) {
 		t.Errorf("marked %q, want %q", got, want)
 	}
+}
+
+func TestExclude(t *testing.T) {
+	c := &fakeClient{files: sampleFiles()}
+	out, _, err := run(t, c, Options{Filter: spec(t, false, "!.spec.")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertContains(t, out, "Marked 2 file(s) as viewed.")
+	want := []string{"src/widget.ts", "src/xspecy.ts"}
+	if got := c.paths(); !slices.Equal(got, want) {
+		t.Errorf("marked %q, want %q", got, want)
+	}
+}
+
+func runner(c *fakeClient, user config.Set) (*Runner, *bytes.Buffer) {
+	var out bytes.Buffer
+	r := &Runner{Client: c, Out: &out, Err: &bytes.Buffer{}}
+	if user != nil {
+		r.UserPresets = func() (config.Set, error) { return user, nil }
+	}
+	return r, &out
+}
+
+func TestPresets(t *testing.T) {
+	c := &fakeClient{
+		files:  append(sampleFiles(), File{Path: "web/pnpm-lock.yaml"}, File{Path: "ui/a.snap"}),
+		config: []byte("presets:\n  specs: ['*.spec.ts', '!test name*']\n"),
+	}
+	user, err := config.Parse([]byte("presets:\n  snaps: ['*.snap']\n"), "user.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, out := runner(c, user)
+	if err := r.Run(context.Background(), Options{Filter: spec(t, false, "@specs", "@lockfiles", "@snaps")}); err != nil {
+		t.Fatal(err)
+	}
+	assertContains(t, out.String(), "Marked 3 file(s) as viewed.")
+	want := []string{"line\nbreak.spec.ts", "ui/a.snap", "web/pnpm-lock.yaml"}
+	if got := c.paths(); !slices.Equal(got, want) {
+		t.Errorf("marked %q, want %q", got, want)
+	}
+
+	out.Reset()
+	if err := r.Presets(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range []string{"@lockfiles", "built-in", "@specs", ".github/pyra.yml", "@snaps", "user.yml", "!test name*"} {
+		assertContains(t, out.String(), s)
+	}
+}
+
+func TestUnknownPreset(t *testing.T) {
+	c := &fakeClient{files: sampleFiles()}
+	_, _, err := run(t, c, Options{Filter: spec(t, false, "@nope")})
+	if err == nil || !strings.Contains(err.Error(), "unknown preset @nope") {
+		t.Fatalf("expected unknown preset error, got %v", err)
+	}
+	if len(c.calls) != 0 {
+		t.Errorf("unexpected calls: %v", c.calls)
+	}
+}
+
+func TestInvalidRepoConfig(t *testing.T) {
+	c := &fakeClient{files: sampleFiles(), config: []byte("presets: [")}
+	_, _, err := run(t, c, Options{Filter: spec(t, false, "@x")})
+	if err == nil || !strings.Contains(err.Error(), ".github/pyra.yml") {
+		t.Fatalf("expected config error, got %v", err)
+	}
+}
+
+func TestPresetsNotLoadedWithoutReferences(t *testing.T) {
+	c := &fakeClient{files: sampleFiles(), config: []byte("presets: [")}
+	if _, _, err := run(t, c, Options{Filter: spec(t, false, ".spec.")}); err != nil {
+		t.Fatalf("broken config must not matter without @presets: %v", err)
+	}
+}
+
+func TestList(t *testing.T) {
+	files := sampleFiles()
+	files[1].State = Dismissed
+	files[1].Additions, files[1].Deletions = 12, 3
+	c := &fakeClient{files: files}
+
+	r, out := runner(c, nil)
+	if err := r.List(context.Background(), ListOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimRight(out.String(), "\n"), "\n")
+	if len(lines) != 6 { // "line\nbreak" spans two lines
+		t.Fatalf("unexpected output:\n%s", out.String())
+	}
+	assertContains(t, out.String(), "viewed    +0   -0  src/widget.spec.ts")
+	assertContains(t, out.String(), "changed   +12  -3  src/xspecy.ts")
+
+	out.Reset()
+	if err := r.List(context.Background(), ListOptions{Filter: spec(t, false, "src/"), States: []State{Dismissed, Viewed}}); err != nil {
+		t.Fatal(err)
+	}
+	assertContains(t, out.String(), "src/xspecy.ts")
+	assertContains(t, out.String(), "src/widget.spec.ts")
+	assertNotContains(t, out.String(), "src/widget.ts\n")
+}
+
+func TestParseState(t *testing.T) {
+	for _, s := range States {
+		got, err := ParseState(s.String())
+		if err != nil || got != s {
+			t.Errorf("ParseState(%q) = %v, %v", s, got, err)
+		}
+	}
+	if _, err := ParseState("nope"); err == nil {
+		t.Error("expected error")
+	}
+}
+
+func TestDismissedIsHiddenAgain(t *testing.T) {
+	c := &fakeClient{files: []File{{Path: "a", State: Dismissed}}}
+	out, _, err := run(t, c, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertContains(t, out, "Marked 1 file(s) as viewed.")
+
+	c = &fakeClient{files: []File{{Path: "a", State: Dismissed}}}
+	out, _, err = run(t, c, Options{Unhide: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertContains(t, out, "Unmarked 0 file(s) as viewed.")
 }
